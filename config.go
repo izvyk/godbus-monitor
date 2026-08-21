@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 )
 
 type Trigger struct {
 	Name          string   `json:"name"`
 	Bus           string   `json:"bus"`
+	Sender        string   `json:"sender,omitempty"`
+	Path          string   `json:"path,omitempty"`
 	Interface     string   `json:"interface"`
 	Property      string   `json:"property"`
 	Operator      string   `json:"operator"`
@@ -26,7 +30,7 @@ const (
 	maxTimeoutSec     = 24 * 60 * 60
 )
 
-var validOperators = map[string]bool{"==": true, "!=": true, ">": true, "<": true, "": true}
+var validOperators = map[string]bool{"==": true, "!=": true, ">": true, "<": true}
 
 func loadConfig(path string) ([]Trigger, error) {
 	info, err := os.Stat(path)
@@ -41,15 +45,18 @@ func loadConfig(path string) ([]Trigger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
-
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var triggers []Trigger
 	if err := dec.Decode(&triggers); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
-	if dec.More() {
-		return nil, fmt.Errorf("parsing config: trailing JSON data")
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parsing config: trailing JSON data")
+		}
+		return nil, fmt.Errorf("parsing config: trailing data: %w", err)
 	}
 
 	seen := make(map[string]bool, len(triggers))
@@ -68,11 +75,14 @@ func loadConfig(path string) ([]Trigger, error) {
 		if t.Interface == "" || t.Property == "" {
 			return nil, fmt.Errorf("trigger %q: interface and property are required", t.Name)
 		}
+		if t.Sender != "" && strings.ContainsAny(t.Sender, " \t\r\n") {
+			return nil, fmt.Errorf("trigger %q: invalid sender", t.Name)
+		}
+		if t.Path != "" && (t.Path[0] != '/' || strings.ContainsAny(t.Path, " \t\r\n")) {
+			return nil, fmt.Errorf("trigger %q: invalid object path", t.Name)
+		}
 		if !validOperators[t.Operator] {
 			return nil, fmt.Errorf("trigger %q: invalid operator %q", t.Name, t.Operator)
-		}
-		if t.Operator == "" {
-			t.Operator = "=="
 		}
 		if len(t.Argv) == 0 || t.Argv[0] == "" {
 			return nil, fmt.Errorf("trigger %q: argv must be non-empty", t.Name)

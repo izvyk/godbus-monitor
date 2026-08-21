@@ -15,18 +15,25 @@ let
     vendorHash = "sha256-YOUR_VENDOR_HASH_HERE";
   };
 
-  # Generate the JSON configuration file dynamically. writeText gives it a
-  # content-addressed store path, and we set the mode below so the copy in
-  # /nix/store (which is world-readable, as everything in the store is) at
-  # least can't be *written* by anything but root.
-  configFile = pkgs.writeText "godbus-monitor.json" (builtins.toJSON cfg.triggers);
+  # The Go binary reads a JSON array of triggers (see Trigger in config.go).
+  # `script` is translated to argv = ["sh" "-c" script] below, matching the
+  # description on the script option.
+  configFile = pkgs.writeText "godbus-monitor.json" (builtins.toJSON
+    (map (t:
+      (builtins.removeAttrs t [ "script" ]) // {
+        argv = [
+          "sh"
+          "-c"
+          t.script
+        ];
+      }) cfg.triggers));
 
   triggerModule = lib.types.submodule {
     options = {
       name = lib.mkOption {
         type = lib.types.str;
         default = "";
-        description = "Label used in logs and for debounce bookkeeping. Auto-generated if left empty.";
+        description = "Label used in logs and for debounce bookkeeping. Auto-generated as trigger-N if left empty.";
       };
       bus = lib.mkOption {
         type = lib.types.enum [
@@ -34,6 +41,16 @@ let
           "session"
         ];
         description = "Which bus to watch this property on.";
+      };
+      sender = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Restrict to signals from this bus name (e.g. org.freedesktop.login1). Empty = any sender.";
+      };
+      path = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Restrict to signals on this object path. Empty = any path.";
       };
       interface = lib.mkOption {
         type = lib.types.str;
