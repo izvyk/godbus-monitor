@@ -1,43 +1,40 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 )
 
-// Trigger defines a single D-Bus event rule.
 type Trigger struct {
-	Name          string `json:"name"`           // optional, used only for logging
-	Bus           string `json:"bus"`             // "system" or "session"
-	Interface     string `json:"interface"`       // e.g. "org.gnome.Mutter.DisplayConfig"
-	Property      string `json:"property"`        // e.g. "PowerSaveMode"
-	Operator      string `json:"operator"`        // "==", "!=", ">", "<" (default "==")
-	ExpectedValue string `json:"expected_value"`  // stringified value, e.g. "0", "true"
-	Script        string `json:"script"`          // sh -c command to run on match
-	DebounceMs    int    `json:"debounce_ms"`     // minimum gap between runs of this trigger (default 250ms)
-	TimeoutSec    int    `json:"timeout_sec"`     // kill the script if it runs longer than this (default 30s)
+	Name          string   `json:"name"`
+	Bus           string   `json:"bus"`
+	Interface     string   `json:"interface"`
+	Property      string   `json:"property"`
+	Operator      string   `json:"operator"`
+	ExpectedValue string   `json:"expected_value"`
+	Argv          []string `json:"argv"`
+	DebounceMs    int      `json:"debounce_ms"`
+	TimeoutSec    int      `json:"timeout_sec"`
 }
 
 const (
 	defaultDebounceMs = 250
 	defaultTimeoutSec = 30
+	maxDebounceMs     = 24 * 60 * 60 * 1000
+	maxTimeoutSec     = 24 * 60 * 60
 )
 
 var validOperators = map[string]bool{"==": true, "!=": true, ">": true, "<": true, "": true}
 
-// loadConfig reads, parses, validates and fills in defaults for the trigger
-// list. It intentionally fails loudly (rather than skipping bad entries) --
-// this daemon runs arbitrary shell commands unattended, so a malformed rule
-// silently doing nothing (or worse, matching more broadly than intended) is
-// worse than refusing to start.
 func loadConfig(path string) ([]Trigger, error) {
-	if info, err := os.Stat(path); err == nil {
-		if mode := info.Mode().Perm(); mode&0o022 != 0 {
-			fmt.Fprintf(os.Stderr,
-				"warning: %s is group/world-writable (mode %v) -- this file controls what shell commands run automatically on D-Bus events, lock it down (chmod 600)\n",
-				path, mode)
-		}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat config: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("config is not a regular file: %s", path)
 	}
 
 	data, err := os.ReadFile(path)
@@ -45,42 +42,52 @@ func loadConfig(path string) ([]Trigger, error) {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
 
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
 	var triggers []Trigger
-	if err := json.Unmarshal(data, &triggers); err != nil {
+	if err := dec.Decode(&triggers); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
+	if dec.More() {
+		return nil, fmt.Errorf("parsing config: trailing JSON data")
+	}
 
-	seen := make(map[string]bool)
+	seen := make(map[string]bool, len(triggers))
 	for i := range triggers {
 		t := &triggers[i]
 		if t.Name == "" {
 			t.Name = fmt.Sprintf("trigger-%d", i)
 		}
 		if seen[t.Name] {
-			return nil, fmt.Errorf("duplicate trigger name %q (name must be unique, it's used to key debouncing)", t.Name)
+			return nil, fmt.Errorf("trigger %q: duplicate name", t.Name)
 		}
 		seen[t.Name] = true
-
 		if t.Bus != "system" && t.Bus != "session" {
-			return nil, fmt.Errorf("trigger %q: bus must be \"system\" or \"session\", got %q", t.Name, t.Bus)
+			return nil, fmt.Errorf("trigger %q: bus must be system or session", t.Name)
 		}
-		if t.Interface == "" {
-			return nil, fmt.Errorf("trigger %q: interface must not be empty", t.Name)
-		}
-		if t.Property == "" {
-			return nil, fmt.Errorf("trigger %q: property must not be empty", t.Name)
-		}
-		if t.Script == "" {
-			return nil, fmt.Errorf("trigger %q: script must not be empty", t.Name)
+		if t.Interface == "" || t.Property == "" {
+			return nil, fmt.Errorf("trigger %q: interface and property are required", t.Name)
 		}
 		if !validOperators[t.Operator] {
-			return nil, fmt.Errorf("trigger %q: unknown operator %q (want one of ==, !=, >, <)", t.Name, t.Operator)
+			return nil, fmt.Errorf("trigger %q: invalid operator %q", t.Name, t.Operator)
 		}
-		if t.DebounceMs <= 0 {
+		if t.Operator == "" {
+			t.Operator = "=="
+		}
+		if len(t.Argv) == 0 || t.Argv[0] == "" {
+			return nil, fmt.Errorf("trigger %q: argv must be non-empty", t.Name)
+		}
+		if t.DebounceMs == 0 {
 			t.DebounceMs = defaultDebounceMs
 		}
-		if t.TimeoutSec <= 0 {
+		if t.TimeoutSec == 0 {
 			t.TimeoutSec = defaultTimeoutSec
+		}
+		if t.DebounceMs < 1 || t.DebounceMs > maxDebounceMs {
+			return nil, fmt.Errorf("trigger %q: debounce_ms must be between 1 and %d", t.Name, maxDebounceMs)
+		}
+		if t.TimeoutSec < 1 || t.TimeoutSec > maxTimeoutSec {
+			return nil, fmt.Errorf("trigger %q: timeout_sec must be between 1 and %d", t.Name, maxTimeoutSec)
 		}
 	}
 	return triggers, nil
