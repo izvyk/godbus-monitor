@@ -19,6 +19,7 @@ type Trigger struct {
 	Operator      string   `json:"operator"`
 	ExpectedValue string   `json:"expected_value"`
 	Argv          []string `json:"argv"`
+	OnlyOnChange  bool     `json:"only_on_change,omitempty"`
 	DebounceMs    int      `json:"debounce_ms"`
 	TimeoutSec    int      `json:"timeout_sec"`
 }

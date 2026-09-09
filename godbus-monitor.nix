@@ -1,3 +1,13 @@
+# godbus-monitor.nix -- Home Manager module.
+#
+# Imported from `home-manager.users.<name>.imports`, NOT from the NixOS-level
+# imports. Uses HM's systemd.user.services directly, so no NixOS-level wiring
+# is needed at all.
+#
+# Nix invocation to get the real vendorHash (run on your NixOS machine):
+#   nix build --no-link --print-out-paths \
+#     --expr 'let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule { pname = "x"; version = "0"; src = <godbusMonitorSrc>; vendorHash = pkgs.lib.fakeHash; }' 2>&1 | grep "got:"
+
 {
   config,
   lib,
@@ -6,27 +16,21 @@
 }:
 
 let
-  cfg = config.services.dbus-trigger;
+  cfg = config.services.godbus-monitor;
 
   triggerPkg = pkgs.buildGoModule {
     pname = "godbus-monitor";
     version = "0.1.0";
-    src = ./.; # Path to your Go code
-    vendorHash = "sha256-YOUR_VENDOR_HASH_HERE";
+    # When this file lives in the godbus-monitor repo itself, ./. is the source.
+    # When you import it from your config via "${godbusMonitorSrc}/godbus-monitor.nix",
+    # ./. is the fetched store path of the repo -- same thing, right result.
+    src = ./.;
+    vendorHash = "sha256-WUTGAYigUjuZLHO1YpVhFSWpvULDZfGMfOXZQqVYAfs=";
   };
 
-  # The Go binary reads a JSON array of triggers (see Trigger in config.go).
-  # `script` is translated to argv = ["sh" "-c" script] below, matching the
-  # description on the script option.
-  configFile = pkgs.writeText "godbus-monitor.json" (builtins.toJSON
-    (map (t:
-      (builtins.removeAttrs t [ "script" ]) // {
-        argv = [
-          "sh"
-          "-c"
-          t.script
-        ];
-      }) cfg.triggers));
+  # The Go binary reads this JSON array verbatim -- the module is a thin
+  # pass-through of the daemon's config format (see Trigger in config.go).
+  configFile = pkgs.writeText "godbus-monitor.json" (builtins.toJSON cfg.triggers);
 
   triggerModule = lib.types.submodule {
     options = {
@@ -45,7 +49,7 @@ let
       sender = lib.mkOption {
         type = lib.types.str;
         default = "";
-        description = "Restrict to signals from this bus name (e.g. org.freedesktop.login1). Empty = any sender.";
+        description = "Restrict to signals from this bus name (e.g. org.freedesktop.login1). Well-known names are resolved to the current owner. Empty = any sender.";
       };
       path = lib.mkOption {
         type = lib.types.str;
@@ -73,9 +77,19 @@ let
         type = lib.types.str;
         example = "true";
       };
-      script = lib.mkOption {
-        type = lib.types.str;
-        description = "Shell command run via `sh -c` when the property matches. Runs with a minimal environment (PATH, HOME, USER, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, WAYLAND_DISPLAY, DISPLAY) -- not the daemon's full environment.";
+      argv = lib.mkOption {
+        type = lib.types.nonEmptyListOf lib.types.str;
+        example = [
+          "sh"
+          "-c"
+          "notify-send hello"
+        ];
+        description = "Command to run, passed straight to exec (no shell unless you add one). For shell commands use [ \"sh\" \"-c\" \"...\" ] -- a `sh = cmd: [ \"sh\" \"-c\" cmd ]` helper in your config keeps this to one line. Runs with a minimal environment (PATH, HOME, USER, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, WAYLAND_DISPLAY, DISPLAY).";
+      };
+      only_on_change = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Only run when this property's value differs from its previous observed value. The first observation is treated as a change.";
       };
       debounce_ms = lib.mkOption {
         type = lib.types.ints.positive;
@@ -91,7 +105,7 @@ let
   };
 in
 {
-  options.services.dbus-trigger = {
+  options.services.godbus-monitor = {
     enable = lib.mkEnableOption "Generic D-Bus Trigger Daemon";
 
     debug = lib.mkEnableOption "verbose debug logging";
@@ -100,31 +114,21 @@ in
       type = lib.types.listOf triggerModule;
       default = [ ];
       description = ''
-        List of D-Bus triggers.
-        Example:
-        [
-          {
-            bus = "session";
-            interface = "org.gnome.Mutter.DisplayConfig";
-            property = "PowerSaveMode";
-            operator = ">";
-            expected_value = "0";
-            script = "systemctl suspend";
-          }
-        ]
+        List of D-Bus triggers. All attribute sets across your Home Manager
+        configuration merge into one list -- no manual combining needed.
       '';
     };
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = triggerPkg.vendorHash != "sha256-YOUR_VENDOR_HASH_HERE";
-        message = "services.dbus-trigger: godbus-monitor.nix still has the placeholder vendorHash -- build once with an empty string to get the real one before enabling this module.";
-      }
-    ];
+    # assertions = [
+    #   {
+    #     assertion = triggerPkg.vendorHash != "sha256-YOUR_VENDOR_HASH_HERE";
+    #     message = "services.godbus-monitor: still has the placeholder vendorHash. Build once with lib.fakeHash and paste the 'got:' hash here.";
+    #   }
+    # ];
 
-    systemd.user.services.dbus-trigger = {
+    systemd.user.services.godbus-monitor = {
       Unit = {
         Description = "Generic D-Bus Trigger";
         PartOf = [ "graphical-session.target" ];
@@ -136,12 +140,9 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # Process-level hardening. This is a *user* unit tied to
-        # graphical-session.target, so the DynamicUser/ProtectSystem=strict
-        # knobs used for system-level services don't really apply -- but the
-        # sandboxing primitives below are still honored for user units on a
-        # reasonably recent systemd and are worth having, since this daemon's
-        # whole job is running shell commands in response to external events.
+        # Process-level hardening. Runs as your user, so DynamicUser-style
+        # knobs don't apply -- but these still work on user units and are
+        # worth having for a daemon whose whole job is running shell commands.
         NoNewPrivileges = true;
         ProtectProc = "invisible";
         RestrictSUIDSGID = true;
@@ -149,10 +150,9 @@ in
         RestrictRealtime = true;
         SystemCallFilter = [ "@system-service" ];
         SystemCallErrorNumber = "EPERM";
-        # If a trigger script needs something outside @system-service (some
-        # interpreters, sandboxing tools, etc.) you'll see it die with EPERM
-        # in the journal -- loosen or drop SystemCallFilter rather than
-        # guessing at the right syscall set.
+        # If a trigger script dies with EPERM in the journal, some interpreter
+        # or tool it calls needs a syscall outside @system-service. Loosen or
+        # drop SystemCallFilter rather than guessing.
       };
 
       Install = {

@@ -17,6 +17,7 @@
     "property": "LockedHint",
     "operator": "==",
     "expected_value": "true",
+    "only_on_change": true,
     "debounce_ms": 500,
     "argv": ["sh", "-c", "playerctl -a -i GSConnect pause; dconf write /org/gnome/shell/extensions/caffeine/cli-toggle false; gdbus call --session --dest org.gnome.Shell --object-path /dev/galets/gkr --method dev.galets.gkr.reset"]
   },
@@ -28,6 +29,7 @@
     "property": "LockedHint",
     "operator": "==",
     "expected_value": "false",
+    "only_on_change": true,
     "debounce_ms": 500,
     "argv": ["sh", "-c", "playerctl play; dconf write /org/gnome/shell/extensions/caffeine/cli-toggle true"]
   }

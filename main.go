@@ -257,7 +257,25 @@ func senderMatches(ctx context.Context, registry *connRegistry, bus, filter, act
 	return owner != "" && owner == actual
 }
 
-func handleSignal(ctx context.Context, e wrappedSignal, triggers []Trigger, runner *scriptRunner, registry *connRegistry, log *slog.Logger) {
+type valueTracker struct {
+	values map[string]any
+}
+
+func newValueTracker() *valueTracker {
+	return &valueTracker{values: make(map[string]any)}
+}
+
+// hasChanged records the latest value for a trigger and reports whether it
+// differs from the previous observation. The first observation counts as a
+// change so a daemon started before the first relevant signal does not miss it.
+func (t *valueTracker) hasChanged(triggerName string, actual any) bool {
+	actual = unwrapVariant(actual)
+	previous, seen := t.values[triggerName]
+	t.values[triggerName] = actual
+	return !seen || !reflect.DeepEqual(previous, actual)
+}
+
+func handleSignal(ctx context.Context, e wrappedSignal, triggers []Trigger, runner *scriptRunner, registry *connRegistry, tracker *valueTracker, log *slog.Logger) {
 	if e.Signal == nil || len(e.Signal.Body) < 2 {
 		return
 	}
@@ -282,7 +300,7 @@ func handleSignal(ctx context.Context, e wrappedSignal, triggers []Trigger, runn
 			continue
 		}
 		if v, exists := changed[t.Property]; exists {
-			checkAndRun(ctx, t, v.Value(), runner, log)
+			checkAndRun(ctx, t, v.Value(), runner, tracker, log)
 			continue
 		}
 		if !slices.Contains(invalidated, t.Property) {
@@ -293,11 +311,15 @@ func handleSignal(ctx context.Context, e wrappedSignal, triggers []Trigger, runn
 			log.Warn("failed to fetch invalidated property", "trigger", t.Name, "error", err)
 			continue
 		}
-		checkAndRun(ctx, t, v, runner, log)
+		checkAndRun(ctx, t, v, runner, tracker, log)
 	}
 }
 
-func checkAndRun(ctx context.Context, t Trigger, actual any, runner *scriptRunner, log *slog.Logger) {
+func checkAndRun(ctx context.Context, t Trigger, actual any, runner *scriptRunner, tracker *valueTracker, log *slog.Logger) {
+	if t.OnlyOnChange && !tracker.hasChanged(t.Name, actual) {
+		log.Debug("ignored unchanged property value", "trigger", t.Name, "value", fmt.Sprintf("%v", actual))
+		return
+	}
 	if evaluateCondition(actual, t.Operator, t.ExpectedValue) {
 		log.Info("trigger matched", "trigger", t.Name, "value", fmt.Sprintf("%v", actual))
 		runner.run(ctx, t, log)
@@ -308,6 +330,7 @@ func checkAndRun(ctx context.Context, t Trigger, actual any, runner *scriptRunne
 // handleSignal. Without this the watchers block on a full channel and no
 // trigger ever fires.
 func startDispatcher(ctx context.Context, events <-chan wrappedSignal, triggers []Trigger, runner *scriptRunner, registry *connRegistry, log *slog.Logger) {
+	tracker := newValueTracker()
 	go func() {
 		for {
 			select {
@@ -315,7 +338,7 @@ func startDispatcher(ctx context.Context, events <-chan wrappedSignal, triggers 
 				if !ok {
 					return
 				}
-				handleSignal(ctx, e, triggers, runner, registry, log)
+				handleSignal(ctx, e, triggers, runner, registry, tracker, log)
 			case <-ctx.Done():
 				return
 			}
