@@ -31,7 +31,7 @@ let
         (lib.fileset.fileFilter (file: file.hasExt "go") ./.)
       ];
     };
-    vendorHash = "sha256-WUTGAYigUjuZLHO1YpVhFSWpvULDZfGMfOXZQqVYAfs=";
+    vendorHash = "sha256-y+3dL8WEiN4PDHLX9/iNijS20wUheiJ+mZrM7af69G0=";
     # The integration tests spawn a private dbus-daemon, and skip without one.
     nativeCheckInputs = [ pkgs.dbus ];
   };
