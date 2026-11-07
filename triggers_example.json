@@ -1,15 +1,5 @@
 [
   {
-    "name": "suspend-on-powersave",
-    "bus": "session",
-    "sender": "org.gnome.Mutter.DisplayConfig",
-    "interface": "org.gnome.Mutter.DisplayConfig",
-    "property": "PowerSaveMode",
-    "operator": ">",
-    "expected_value": "0",
-    "argv": ["systemctl", "suspend"]
-  },
-  {
     "name": "on-lock",
     "bus": "system",
     "sender": "org.freedesktop.login1",
@@ -19,7 +9,7 @@
     "expected_value": "true",
     "only_on_change": true,
     "debounce_ms": 500,
-    "argv": ["sh", "-c", "playerctl -a -i GSConnect pause; dconf write /org/gnome/shell/extensions/caffeine/cli-toggle false; gdbus call --session --dest org.gnome.Shell --object-path /dev/galets/gkr --method dev.galets.gkr.reset"]
+    "argv": ["sh", "-c", "playerctl -a -i GSConnect pause; rm -f \"$XDG_RUNTIME_DIR/caffeine-was-enabled\"; if [ \"$(dconf read /org/gnome/shell/extensions/caffeine/cli-toggle)\" = true ]; then touch \"$XDG_RUNTIME_DIR/caffeine-was-enabled\"; fi; dconf write /org/gnome/shell/extensions/caffeine/cli-toggle false"]
   },
   {
     "name": "on-unlock",
@@ -31,6 +21,27 @@
     "expected_value": "false",
     "only_on_change": true,
     "debounce_ms": 500,
-    "argv": ["sh", "-c", "playerctl play; dconf write /org/gnome/shell/extensions/caffeine/cli-toggle true"]
+    "argv": ["sh", "-c", "if [ -f \"$XDG_RUNTIME_DIR/caffeine-was-enabled\" ]; then dconf write /org/gnome/shell/extensions/caffeine/cli-toggle true; rm -f \"$XDG_RUNTIME_DIR/caffeine-was-enabled\"; fi"]
+  },
+  {
+    "name": "on-screen-black",
+    "bus": "session",
+    "sender": "org.gnome.ScreenSaver",
+    "path": "/org/gnome/ScreenSaver",
+    "interface": "org.gnome.ScreenSaver",
+    "signal": "ActiveChanged",
+    "operator": "==",
+    "expected_value": "true",
+    "argv": ["logger", "screen faded to black"]
+  },
+  {
+    "name": "suspend-on-display-off",
+    "bus": "session",
+    "sender": "org.gnome.Mutter.DisplayConfig",
+    "interface": "org.gnome.Mutter.DisplayConfig",
+    "property": "PowerSaveMode",
+    "operator": ">",
+    "expected_value": "0",
+    "argv": ["systemctl", "--no-block", "suspend"]
   }
 ]

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -18,8 +19,18 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
+const (
+	propertiesInterface = "org.freedesktop.DBus.Properties"
+	busCallTimeout      = 2 * time.Second
+	minBackoff          = time.Second
+	maxBackoff          = 30 * time.Second
+)
+
+// wrappedSignal is a signal plus the connection that delivered it, so handlers
+// can call back over that same connection.
 type wrappedSignal struct {
 	Bus    string
+	Conn   *dbus.Conn
 	Signal *dbus.Signal
 }
 
@@ -35,6 +46,9 @@ func unwrapVariant(v any) any {
 
 func evaluateCondition(actual any, operator, expected string) bool {
 	actual = unwrapVariant(actual)
+	if path, ok := actual.(dbus.ObjectPath); ok {
+		actual = string(path)
+	}
 	switch v := actual.(type) {
 	case string:
 		switch operator {
@@ -62,9 +76,8 @@ func evaluateCondition(actual any, operator, expected string) bool {
 	return false
 }
 
-// asFloat converts any numeric value to float64. Reflection keeps this to a
-// few lines instead of one switch arm per integer width, and covers kinds the
-// hand-written list missed (notably uint8, which is D-Bus's "byte" type).
+// asFloat converts any numeric value to float64. Integers beyond 2^53 lose
+// precision, which is acceptable for the thresholds triggers compare against.
 func asFloat(v any) (float64, bool) {
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
@@ -97,36 +110,11 @@ func compareNumber(actual float64, operator, expected string) bool {
 	}
 }
 
-type connRegistry struct {
-	mu    sync.RWMutex
-	conns map[string]*dbus.Conn
-}
-
-func newConnRegistry() *connRegistry { return &connRegistry{conns: make(map[string]*dbus.Conn)} }
-func (r *connRegistry) set(name string, c *dbus.Conn) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c == nil {
-		delete(r.conns, name)
-	} else {
-		r.conns[name] = c
-	}
-}
-func (r *connRegistry) get(name string) *dbus.Conn {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.conns[name]
-}
-
-func (r *connRegistry) fetchProperty(ctx context.Context, bus, sender, path, iface, prop string) (any, error) {
-	conn := r.get(bus)
-	if conn == nil {
-		return nil, fmt.Errorf("no live connection on %s bus", bus)
-	}
-	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+func fetchProperty(ctx context.Context, conn *dbus.Conn, sig *dbus.Signal, iface, prop string) (any, error) {
+	callCtx, cancel := context.WithTimeout(ctx, busCallTimeout)
 	defer cancel()
 	var v dbus.Variant
-	call := conn.Object(sender, dbus.ObjectPath(path)).CallWithContext(callCtx, "org.freedesktop.DBus.Properties.Get", 0, iface, prop)
+	call := conn.Object(sig.Sender, sig.Path).CallWithContext(callCtx, propertiesInterface+".Get", 0, iface, prop)
 	if err := call.Store(&v); err != nil {
 		return nil, err
 	}
@@ -135,12 +123,8 @@ func (r *connRegistry) fetchProperty(ctx context.Context, bus, sender, path, ifa
 
 // nameOwner resolves a well-known bus name (e.g. "org.freedesktop.login1")
 // to its current unique owner (e.g. ":1.42").
-func (r *connRegistry) nameOwner(ctx context.Context, bus, name string) (string, error) {
-	conn := r.get(bus)
-	if conn == nil {
-		return "", fmt.Errorf("no live connection on %s bus", bus)
-	}
-	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+func nameOwner(ctx context.Context, conn *dbus.Conn, name string) (string, error) {
+	callCtx, cancel := context.WithTimeout(ctx, busCallTimeout)
 	defer cancel()
 	var owner string
 	err := conn.BusObject().CallWithContext(callCtx, "org.freedesktop.DBus.GetNameOwner", 0, name).Store(&owner)
@@ -149,85 +133,79 @@ func (r *connRegistry) nameOwner(ctx context.Context, bus, name string) (string,
 
 type busWatcher struct {
 	name     string
-	connect  func() (*dbus.Conn, error)
+	connect  func(...dbus.ConnOption) (*dbus.Conn, error)
 	triggers []Trigger
 	events   chan<- wrappedSignal
-	registry *connRegistry
 	log      *slog.Logger
 }
 
+// run keeps a watch alive until ctx is cancelled. Every retry backs off, not
+// only failed connects: a bus that accepts connections but rejects a match rule
+// would otherwise spin.
 func (w *busWatcher) run(ctx context.Context) {
-	backoff := time.Second
-	defer w.registry.set(w.name, nil)
-	for ctx.Err() == nil {
-		conn, err := w.connect()
-		if err != nil {
-			w.log.Error("bus connect failed", "bus", w.name, "error", err, "retry_in", backoff)
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			continue
+	backoff := minBackoff
+	for {
+		started := time.Now()
+		conn, err := w.connect(dbus.WithContext(ctx))
+		if err == nil {
+			err = w.watch(ctx, conn)
+			_ = conn.Close()
 		}
-		backoff = time.Second
-		w.registry.set(w.name, conn)
-		retry := w.watch(ctx, conn)
-		w.registry.set(w.name, nil)
-		_ = conn.Close()
-		if !retry {
+		if ctx.Err() != nil {
 			return
 		}
-		w.log.Warn("bus connection lost, reconnecting", "bus", w.name)
+		// Only a connection that stayed up counts as having recovered.
+		if time.Since(started) > maxBackoff {
+			backoff = minBackoff
+		}
+		w.log.Warn("bus disconnected, retrying", "bus", w.name, "error", err, "retry_in", backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
+		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
-func (w *busWatcher) watch(ctx context.Context, conn *dbus.Conn) bool {
-	interfaces := make(map[string]bool)
-	for _, t := range w.triggers {
-		interfaces[t.Interface] = true
+func matchOptions(t Trigger) []dbus.MatchOption {
+	if t.Signal != "" {
+		return []dbus.MatchOption{dbus.WithMatchInterface(t.Interface), dbus.WithMatchMember(t.Signal)}
 	}
-	var registered []string
-	for iface := range interfaces {
-		if err := conn.AddMatchSignal(
-			dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
-			dbus.WithMatchMember("PropertiesChanged"),
-			dbus.WithMatchArg(0, iface),
-		); err != nil {
-			w.log.Error("failed to register match rule", "bus", w.name, "interface", iface, "error", err)
-			for _, prev := range registered {
-				_ = conn.RemoveMatchSignal(
-					dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
-					dbus.WithMatchMember("PropertiesChanged"),
-					dbus.WithMatchArg(0, prev),
-				)
-			}
-			return true
-		}
-		registered = append(registered, iface)
+	return []dbus.MatchOption{
+		dbus.WithMatchInterface(propertiesInterface),
+		dbus.WithMatchMember("PropertiesChanged"),
+		dbus.WithMatchArg(0, t.Interface),
 	}
+}
 
+// watch forwards signals until the connection is lost or ctx is cancelled. The
+// caller closes conn, which also drops its match rules and receiver. Triggers
+// sharing a rule are harmless: the bus delivers a signal once per connection.
+func (w *busWatcher) watch(ctx context.Context, conn *dbus.Conn) error {
+	// Register the local receiver before match rules so newly subscribed
+	// signals cannot arrive before there is a channel to receive them.
 	ch := make(chan *dbus.Signal, 256)
 	conn.Signal(ch)
+	for _, t := range w.triggers {
+		if err := conn.AddMatchSignal(matchOptions(t)...); err != nil {
+			return fmt.Errorf("register match rule for trigger %q: %w", t.Name, err)
+		}
+	}
 	w.log.Info("watching bus", "bus", w.name, "triggers", len(w.triggers))
 	for {
 		select {
 		case sig, ok := <-ch:
 			if !ok {
-				return true
+				return errors.New("connection lost")
 			}
 			select {
-			case w.events <- wrappedSignal{Bus: w.name, Signal: sig}:
+			case w.events <- wrappedSignal{Bus: w.name, Conn: conn, Signal: sig}:
 			case <-ctx.Done():
-				conn.RemoveSignal(ch)
-				return false
+				return ctx.Err()
 			}
 		case <-ctx.Done():
-			conn.RemoveSignal(ch)
-			return false
+			return ctx.Err()
 		}
 	}
 }
@@ -237,7 +215,7 @@ func (w *busWatcher) watch(ctx context.Context, conn *dbus.Conn) bool {
 // names ("org.freedesktop.login1") are resolved to the current owner via
 // GetNameOwner, so configs stay portable across machines. Resolved owners are
 // memoized per signal to avoid repeated bus round-trips.
-func senderMatches(ctx context.Context, registry *connRegistry, bus, filter, actual string, memo map[string]string, log *slog.Logger) bool {
+func senderMatches(ctx context.Context, conn *dbus.Conn, filter, actual string, memo map[string]string, log *slog.Logger) bool {
 	if filter == actual {
 		return true
 	}
@@ -247,10 +225,9 @@ func senderMatches(ctx context.Context, registry *connRegistry, bus, filter, act
 	owner, ok := memo[filter]
 	if !ok {
 		var err error
-		owner, err = registry.nameOwner(ctx, bus, filter)
+		owner, err = nameOwner(ctx, conn, filter)
 		if err != nil {
-			log.Debug("failed to resolve sender name", "name", filter, "bus", bus, "error", err)
-			owner = ""
+			log.Debug("failed to resolve sender name", "name", filter, "error", err)
 		}
 		memo[filter] = owner
 	}
@@ -275,28 +252,40 @@ func (t *valueTracker) hasChanged(triggerName string, actual any) bool {
 	return !seen || !reflect.DeepEqual(previous, actual)
 }
 
-func handleSignal(ctx context.Context, e wrappedSignal, triggers []Trigger, runner *scriptRunner, registry *connRegistry, tracker *valueTracker, log *slog.Logger) {
-	if e.Signal == nil || len(e.Signal.Body) < 2 {
+func handleSignal(ctx context.Context, e wrappedSignal, triggers []Trigger, runner *scriptRunner, tracker *valueTracker, log *slog.Logger) {
+	if e.Signal == nil {
 		return
 	}
-	iface, ok := e.Signal.Body[0].(string)
-	if !ok {
-		return
-	}
-	changed, ok := e.Signal.Body[1].(map[string]dbus.Variant)
-	if !ok {
-		return
-	}
+	var iface string
+	var changed map[string]dbus.Variant
 	var invalidated []string
-	if len(e.Signal.Body) >= 3 {
-		invalidated, _ = e.Signal.Body[2].([]string)
+	validProperties := false
+	if e.Signal.Name == propertiesInterface+".PropertiesChanged" && len(e.Signal.Body) >= 2 {
+		var validInterface, validChanged bool
+		iface, validInterface = e.Signal.Body[0].(string)
+		changed, validChanged = e.Signal.Body[1].(map[string]dbus.Variant)
+		validProperties = validInterface && validChanged
+		if len(e.Signal.Body) >= 3 {
+			invalidated, _ = e.Signal.Body[2].([]string)
+		}
 	}
 	senderMemo := make(map[string]string)
 	for _, t := range triggers {
-		if t.Bus != e.Bus || t.Interface != iface || (t.Path != "" && string(e.Signal.Path) != t.Path) {
+		if t.Bus != e.Bus || (t.Path != "" && string(e.Signal.Path) != t.Path) {
 			continue
 		}
-		if t.Sender != "" && !senderMatches(ctx, registry, e.Bus, t.Sender, e.Signal.Sender, senderMemo, log) {
+		if t.Signal != "" {
+			if e.Signal.Name != t.Interface+"."+t.Signal || t.Argument >= len(e.Signal.Body) {
+				continue
+			}
+		} else if !validProperties || t.Interface != iface {
+			continue
+		}
+		if t.Sender != "" && !senderMatches(ctx, e.Conn, t.Sender, e.Signal.Sender, senderMemo, log) {
+			continue
+		}
+		if t.Signal != "" {
+			checkAndRun(ctx, t, e.Signal.Body[t.Argument], runner, tracker, log)
 			continue
 		}
 		if v, exists := changed[t.Property]; exists {
@@ -306,7 +295,7 @@ func handleSignal(ctx context.Context, e wrappedSignal, triggers []Trigger, runn
 		if !slices.Contains(invalidated, t.Property) {
 			continue
 		}
-		v, err := registry.fetchProperty(ctx, e.Bus, e.Signal.Sender, string(e.Signal.Path), t.Interface, t.Property)
+		v, err := fetchProperty(ctx, e.Conn, e.Signal, t.Interface, t.Property)
 		if err != nil {
 			log.Warn("failed to fetch invalidated property", "trigger", t.Name, "error", err)
 			continue
@@ -317,38 +306,41 @@ func handleSignal(ctx context.Context, e wrappedSignal, triggers []Trigger, runn
 
 func checkAndRun(ctx context.Context, t Trigger, actual any, runner *scriptRunner, tracker *valueTracker, log *slog.Logger) {
 	if t.OnlyOnChange && !tracker.hasChanged(t.Name, actual) {
-		log.Debug("ignored unchanged property value", "trigger", t.Name, "value", fmt.Sprintf("%v", actual))
+		log.Debug("ignored unchanged value", "trigger", t.Name, "value", actual)
 		return
 	}
-	if evaluateCondition(actual, t.Operator, t.ExpectedValue) {
-		log.Info("trigger matched", "trigger", t.Name, "value", fmt.Sprintf("%v", actual))
-		runner.run(ctx, t, log)
+	if !evaluateCondition(actual, t.Operator, t.ExpectedValue) {
+		log.Debug("condition not met", "trigger", t.Name, "value", actual, "type", fmt.Sprintf("%T", actual))
+		return
 	}
+	log.Info("trigger matched", "trigger", t.Name, "value", actual)
+	runner.run(ctx, t, log)
 }
 
 // startDispatcher drains the shared events channel and routes each signal to
-// handleSignal. Without this the watchers block on a full channel and no
-// trigger ever fires.
-func startDispatcher(ctx context.Context, events <-chan wrappedSignal, triggers []Trigger, runner *scriptRunner, registry *connRegistry, log *slog.Logger) {
+// handleSignal. The returned channel closes once it has stopped, after which
+// no new runs can start.
+func startDispatcher(ctx context.Context, events <-chan wrappedSignal, triggers []Trigger, runner *scriptRunner, log *slog.Logger) <-chan struct{} {
 	tracker := newValueTracker()
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for {
 			select {
-			case e, ok := <-events:
-				if !ok {
-					return
-				}
-				handleSignal(ctx, e, triggers, runner, registry, tracker, log)
+			case e := <-events:
+				handleSignal(ctx, e, triggers, runner, tracker, log)
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+	return done
 }
 
 func main() {
 	configPath := flag.String("config", "triggers.json", "path to JSON trigger config")
 	validateOnly := flag.Bool("validate", false, "validate config and exit")
+	dryRun := flag.Bool("dry-run", false, "watch the buses and log matches without running any command")
 	debug := flag.Bool("debug", false, "enable debug logging")
 	flag.Parse()
 
@@ -370,31 +362,28 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	events := make(chan wrappedSignal, 256)
-	registry := newConnRegistry()
 	runner := newScriptRunner()
-	startDispatcher(ctx, events, triggers, runner, registry, logger)
-	var wg sync.WaitGroup
-	byBus := map[string][]Trigger{"system": {}, "session": {}}
-	for _, t := range triggers {
-		byBus[t.Bus] = append(byBus[t.Bus], t)
-	}
+	runner.dryRun = *dryRun
+	dispatcherDone := startDispatcher(ctx, events, triggers, runner, logger)
 
-	startBus := func(name string, connect func() (*dbus.Conn, error)) {
-		if len(byBus[name]) == 0 {
-			return
+	var wg sync.WaitGroup
+	for name, connect := range map[string]func(...dbus.ConnOption) (*dbus.Conn, error){
+		"system":  dbus.ConnectSystemBus,
+		"session": dbus.ConnectSessionBus,
+	} {
+		onBus := slices.DeleteFunc(slices.Clone(triggers), func(t Trigger) bool { return t.Bus != name })
+		if len(onBus) == 0 {
+			continue
 		}
-		ts := append([]Trigger(nil), byBus[name]...)
-		slices.SortFunc(ts, func(a, b Trigger) int { return strings.Compare(a.Name, b.Name) })
-		w := &busWatcher{name: name, connect: connect, triggers: ts, events: events, registry: registry, log: logger}
+		w := &busWatcher{name: name, connect: connect, triggers: onBus, events: events, log: logger}
 		wg.Add(1)
 		go func() { defer wg.Done(); w.run(ctx) }()
 	}
 
-	startBus("system", dbus.SystemBus)
-	startBus("session", dbus.SessionBus)
-	logger.Info("generic D-Bus trigger daemon running")
+	logger.Info("generic D-Bus trigger daemon running", "dry_run", *dryRun)
 	<-ctx.Done()
 	wg.Wait()
+	<-dispatcherDone
 	runner.wait()
 	logger.Info("stopped")
 }

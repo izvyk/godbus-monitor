@@ -4,9 +4,8 @@
 # imports. Uses HM's systemd.user.services directly, so no NixOS-level wiring
 # is needed at all.
 #
-# Nix invocation to get the real vendorHash (run on your NixOS machine):
-#   nix build --no-link --print-out-paths \
-#     --expr 'let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule { pname = "x"; version = "0"; src = <godbusMonitorSrc>; vendorHash = pkgs.lib.fakeHash; }' 2>&1 | grep "got:"
+# After changing dependencies: set vendorHash to lib.fakeHash, rebuild, and
+# paste the "got:" hash from the error.
 
 {
   config,
@@ -21,16 +20,31 @@ let
   triggerPkg = pkgs.buildGoModule {
     pname = "godbus-monitor";
     version = "0.1.0";
-    # When this file lives in the godbus-monitor repo itself, ./. is the source.
-    # When you import it from your config via "${godbusMonitorSrc}/godbus-monitor.nix",
-    # ./. is the fetched store path of the repo -- same thing, right result.
-    src = ./.;
+    # Whether ./. is this repo or a fetched store path, copy only what the build
+    # needs: a bare ./. would pull local binaries and .direnv into the store.
+    src = lib.fileset.toSource {
+      root = ./.;
+      fileset = lib.fileset.unions [
+        ./go.mod
+        ./go.sum
+        ./triggers_example.json # loaded by the tests
+        (lib.fileset.fileFilter (file: file.hasExt "go") ./.)
+      ];
+    };
     vendorHash = "sha256-WUTGAYigUjuZLHO1YpVhFSWpvULDZfGMfOXZQqVYAfs=";
+    # The integration tests spawn a private dbus-daemon, and skip without one.
+    nativeCheckInputs = [ pkgs.dbus ];
   };
 
   # The Go binary reads this JSON array verbatim -- the module is a thin
   # pass-through of the daemon's config format (see Trigger in config.go).
-  configFile = pkgs.writeText "godbus-monitor.json" (builtins.toJSON cfg.triggers);
+  # Validating with the daemon itself keeps the rules in one place: a bad
+  # trigger fails the build rather than the service.
+  configFile = pkgs.writeTextFile {
+    name = "godbus-monitor.json";
+    text = builtins.toJSON cfg.triggers;
+    checkPhase = ''${triggerPkg}/bin/godbus-monitor -validate -config "$target"'';
+  };
 
   triggerModule = lib.types.submodule {
     options = {
@@ -44,12 +58,12 @@ let
           "system"
           "session"
         ];
-        description = "Which bus to watch this property on.";
+        description = "Which bus to watch the property or signal on.";
       };
       sender = lib.mkOption {
         type = lib.types.str;
         default = "";
-        description = "Restrict to signals from this bus name (e.g. org.freedesktop.login1). Well-known names are resolved to the current owner. Empty = any sender.";
+        description = "Restrict to signals from this bus name (e.g. org.freedesktop.login1). Well-known names are resolved to the current owner. Empty = any sender, which is rejected on the system bus because any local user can emit signals there.";
       };
       path = lib.mkOption {
         type = lib.types.str;
@@ -62,7 +76,20 @@ let
       };
       property = lib.mkOption {
         type = lib.types.str;
+        default = "";
         example = "LockedHint";
+        description = "Property to watch via org.freedesktop.DBus.Properties.PropertiesChanged on the configured interface. Mutually exclusive with signal; exactly one must be nonempty.";
+      };
+      signal = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "ActiveChanged";
+        description = "Signal member to watch on the configured interface. Mutually exclusive with property; exactly one must be nonempty.";
+      };
+      argument = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 0;
+        description = "Zero-based signal argument index whose value is compared with expected_value. Only used for signal triggers.";
       };
       operator = lib.mkOption {
         type = lib.types.enum [
@@ -84,12 +111,12 @@ let
           "-c"
           "notify-send hello"
         ];
-        description = "Command to run, passed straight to exec (no shell unless you add one). For shell commands use [ \"sh\" \"-c\" \"...\" ] -- a `sh = cmd: [ \"sh\" \"-c\" cmd ]` helper in your config keeps this to one line. Runs with a minimal environment (PATH, HOME, USER, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, WAYLAND_DISPLAY, DISPLAY).";
+        description = "Command to run, passed straight to exec (no shell unless you add one). For shell commands use [ \"sh\" \"-c\" \"...\" ] -- a `sh = cmd: [ \"sh\" \"-c\" cmd ]` helper in your config keeps this to one line. Runs with a minimal environment (see safeEnv in executor.go).";
       };
       only_on_change = lib.mkOption {
         type = lib.types.bool;
         default = false;
-        description = "Only run when this property's value differs from its previous observed value. The first observation is treated as a change.";
+        description = "Only run when the selected value (property value or signal argument) differs from its previous observed value. The first observation is treated as a change.";
       };
       debounce_ms = lib.mkOption {
         type = lib.types.ints.positive;
@@ -121,13 +148,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # assertions = [
-    #   {
-    #     assertion = triggerPkg.vendorHash != "sha256-YOUR_VENDOR_HASH_HERE";
-    #     message = "services.godbus-monitor: still has the placeholder vendorHash. Build once with lib.fakeHash and paste the 'got:' hash here.";
-    #   }
-    # ];
-
     systemd.user.services.godbus-monitor = {
       Unit = {
         Description = "Generic D-Bus Trigger";
@@ -141,10 +161,10 @@ in
         RestartSec = "5s";
 
         # Process-level hardening. Runs as your user, so DynamicUser-style
-        # knobs don't apply -- but these still work on user units and are
-        # worth having for a daemon whose whole job is running shell commands.
+        # knobs don't apply, and mount-namespace ones like ProtectProc are
+        # unsupported on user units -- but these still work and are worth
+        # having for a daemon whose whole job is running shell commands.
         NoNewPrivileges = true;
-        ProtectProc = "invisible";
         RestrictSUIDSGID = true;
         LockPersonality = true;
         RestrictRealtime = true;

@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -33,14 +31,20 @@ type scriptRunner struct {
 	mu     sync.Mutex
 	states map[string]*triggerState
 	wg     sync.WaitGroup
+	dryRun bool
 }
 
-const maxOutputBytes = 64 * 1024
+const (
+	maxOutputBytes = 64 * 1024
+	// killGrace is how long a cancelled process group gets to exit on SIGTERM,
+	// and how long a finished command's background children may hold its output.
+	killGrace = 2 * time.Second
+)
 
 func newScriptRunner() *scriptRunner { return &scriptRunner{states: make(map[string]*triggerState)} }
 
 func safeEnv() []string {
-	keep := []string{"PATH", "HOME", "USER", "LOGNAME", "SHELL", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "DISPLAY"}
+	keep := []string{"PATH", "HOME", "USER", "LOGNAME", "SHELL", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY"}
 	env := make([]string, 0, len(keep))
 	for _, k := range keep {
 		if v, ok := os.LookupEnv(k); ok {
@@ -56,17 +60,9 @@ type cappedBuffer struct {
 }
 
 func (w *cappedBuffer) Write(p []byte) (int, error) {
-	remaining := maxOutputBytes - len(w.b)
-	if remaining > 0 {
-		if len(p) > remaining {
-			w.b = append(w.b, p[:remaining]...)
-			w.truncated = true
-		} else {
-			w.b = append(w.b, p...)
-		}
-	} else {
-		w.truncated = true
-	}
+	n := min(len(p), maxOutputBytes-len(w.b))
+	w.b = append(w.b, p[:n]...)
+	w.truncated = w.truncated || n < len(p)
 	return len(p), nil
 }
 
@@ -77,16 +73,25 @@ func (w *cappedBuffer) String() string {
 	return string(w.b)
 }
 
-// startLocked transitions to a running state. Caller must hold r.mu and have
-// verified the trigger is neither running nor inside the debounce window.
-func (r *scriptRunner) startLocked(s *triggerState) {
+// startLocked transitions to a running state and launches the command. Caller
+// must hold r.mu and have verified the trigger is neither running nor inside
+// the debounce window.
+func (r *scriptRunner) startLocked(ctx context.Context, s *triggerState, t Trigger, log *slog.Logger) {
 	s.running = true
 	s.lastRun = time.Now()
 	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.execute(ctx, t, log)
+	}()
 }
 
 func (r *scriptRunner) run(ctx context.Context, t Trigger, log *slog.Logger) {
+	if ctx.Err() != nil {
+		return
+	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	s := r.states[t.Name]
 	if s == nil {
 		s = &triggerState{}
@@ -96,7 +101,6 @@ func (r *scriptRunner) run(ctx context.Context, t Trigger, log *slog.Logger) {
 	case s.running:
 		// A run is in flight; execute()'s defer will pay this debt.
 		s.pending = true
-		r.mu.Unlock()
 		log.Debug("coalesced trigger event", "trigger", t.Name)
 	case !s.lastRun.IsZero() && time.Since(s.lastRun) < time.Duration(t.DebounceMs)*time.Millisecond:
 		// Inside the debounce window: schedule a single delayed run. Further
@@ -106,12 +110,9 @@ func (r *scriptRunner) run(ctx context.Context, t Trigger, log *slog.Logger) {
 			r.wg.Add(1)
 			go r.delayedRun(ctx, t, log)
 		}
-		r.mu.Unlock()
 		log.Debug("debounced trigger event", "trigger", t.Name)
 	default:
-		r.startLocked(s)
-		r.mu.Unlock()
-		r.executeAsync(ctx, t, log)
+		r.startLocked(ctx, s, t, log)
 	}
 }
 
@@ -125,30 +126,18 @@ func (r *scriptRunner) delayedRun(ctx context.Context, t Trigger, log *slog.Logg
 	select {
 	case <-timer.C:
 	case <-ctx.Done():
-		r.mu.Lock()
-		r.states[t.Name].timerSet = false
-		r.mu.Unlock()
 		return
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	s := r.states[t.Name]
 	s.timerSet = false
 	if s.running {
 		// A run started while we were waiting; hand the debt to its defer.
 		s.pending = true
-		r.mu.Unlock()
 		return
 	}
-	r.startLocked(s)
-	r.mu.Unlock()
-	r.executeAsync(ctx, t, log)
-}
-
-func (r *scriptRunner) executeAsync(ctx context.Context, t Trigger, log *slog.Logger) {
-	go func() {
-		defer r.wg.Done()
-		r.execute(ctx, t, log)
-	}()
+	r.startLocked(ctx, s, t, log)
 }
 
 // execute runs the trigger command. The caller must have already set
@@ -161,73 +150,53 @@ func (r *scriptRunner) execute(parent context.Context, t Trigger, log *slog.Logg
 		pending := s.pending
 		s.pending = false
 		r.mu.Unlock()
-		if pending && parent.Err() == nil {
+		if pending {
 			r.run(parent, t, log)
 		}
 	}()
+
+	// Checked here rather than in run so dry runs show real debounce behaviour.
+	if r.dryRun {
+		log.Info("dry run: would run", "trigger", t.Name, "argv", t.Argv)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(parent, time.Duration(t.TimeoutSec)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, t.Argv[0], t.Argv[1:]...)
 	cmd.Env = safeEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// SIGTERM the whole group so scripts can clean up, instead of CommandContext's
+	// default of SIGKILLing only the direct child.
+	cmd.Cancel = func() error {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		return nil
+	}
+	cmd.WaitDelay = killGrace
 	var out cappedBuffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {
 		log.Error("trigger failed to start", "trigger", t.Name, "error", err)
 		return
 	}
-	// CommandContext kills only the direct child on timeout, not the whole
-	// group we created with Setpgid. We handle group termination ourselves in
-	// the ctx.Done() branch; WaitDelay keeps cmd.Wait() from hanging if the
-	// child double-forks.
-	cmd.WaitDelay = 500 * time.Millisecond
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			log.Error("trigger failed", "trigger", t.Name, "error", err, "output", out.String())
-		} else if len(out.b) > 0 {
-			log.Debug("trigger completed", "trigger", t.Name, "output", out.String())
-		} else {
-			log.Info("trigger completed", "trigger", t.Name)
-		}
-	case <-ctx.Done():
-		if err := terminateProcessGroup(cmd.Process); err != nil {
-			log.Warn("failed to terminate process group", "trigger", t.Name, "error", err)
-		}
-		<-done
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			log.Error("trigger timed out", "trigger", t.Name, "timeout_sec", t.TimeoutSec, "output", out.String())
-		} else {
-			log.Debug("trigger cancelled", "trigger", t.Name)
-		}
+	err := cmd.Wait()
+	if ctx.Err() != nil {
+		// WaitDelay only escalates to SIGKILL on the direct child.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	switch {
+	case err == nil:
+		log.Info("trigger completed", "trigger", t.Name)
+		log.Debug("trigger output", "trigger", t.Name, "output", out.String())
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		log.Error("trigger timed out", "trigger", t.Name, "timeout_sec", t.TimeoutSec, "output", out.String())
+	case ctx.Err() != nil:
+		log.Debug("trigger cancelled", "trigger", t.Name)
+	case errors.Is(err, exec.ErrWaitDelay):
+		log.Warn("trigger completed but a background process kept its output open; redirect that process's output", "trigger", t.Name)
+	default:
+		log.Error("trigger failed", "trigger", t.Name, "error", err, "output", out.String())
 	}
 }
 
 func (r *scriptRunner) wait() { r.wg.Wait() }
-
-func terminateProcessGroup(p *os.Process) error {
-	if p == nil {
-		return nil
-	}
-	if err := syscall.Kill(-p.Pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("send SIGTERM: %w", err)
-	}
-	// Give the group a moment to exit on SIGTERM before escalating, but don't
-	// sleep unconditionally when the process is already gone.
-	for range 20 {
-		if err := syscall.Kill(-p.Pid, 0); errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("send SIGKILL: %w", err)
-	}
-	return nil
-}
-
-var _ io.Writer = (*cappedBuffer)(nil)

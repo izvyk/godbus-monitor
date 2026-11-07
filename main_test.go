@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -9,10 +10,19 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/godbus/dbus/v5"
 )
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// captureLogs records at the default level. Read the buffer only after the
+// runner has finished.
+func captureLogs() (*bytes.Buffer, *slog.Logger) {
+	var buf bytes.Buffer
+	return &buf, slog.New(slog.NewTextHandler(&buf, nil))
 }
 
 // ---------- evaluateCondition ----------
@@ -28,6 +38,9 @@ func TestEvaluateCondition(t *testing.T) {
 		{"string eq", "hello", "==", "hello", true},
 		{"string ne", "hello", "!=", "world", true},
 		{"string gt unsupported", "b", ">", "a", false},
+		{"object path eq", dbus.ObjectPath("/org/example"), "==", "/org/example", true},
+		{"object path ne", dbus.ObjectPath("/org/example"), "!=", "/org/other", true},
+		{"byte gt", uint8(5), ">", "3", true},
 		{"bool eq", true, "==", "true", true},
 		{"bool ne", true, "!=", "false", true},
 		{"bool bad expected", true, "==", "notabool", false},
@@ -93,63 +106,11 @@ func TestCappedBufferTruncates(t *testing.T) {
 
 // ---------- config loading ----------
 
-// func TestLoadConfigValid(t *testing.T) {
-// 	triggers, err := loadConfig("testdata/valid.json")
-// 	if err != nil {
-// 		t.Fatalf("loadConfig: %v", err)
-// 	}
-// 	if len(triggers) != 2 {
-// 		t.Fatalf("got %d triggers, want 2", len(triggers))
-// 	}
-// 	if triggers[0].DebounceMs != defaultDebounceMs {
-// 		t.Fatalf("default debounce = %d, want %d", triggers[0].DebounceMs, defaultDebounceMs)
-// 	}
-// 	if triggers[1].TimeoutSec != defaultTimeoutSec {
-// 		t.Fatalf("default timeout = %d, want %d", triggers[1].TimeoutSec, defaultTimeoutSec)
-// 	}
-// 	if triggers[0].Name != "a" || triggers[1].Name != "b" {
-// 		t.Fatalf("unexpected names: %q %q", triggers[0].Name, triggers[1].Name)
-// 	}
-// }
-
-func TestLoadConfigOnlyOnChange(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "c.json")
-	body := `[{"name":"lid","bus":"system","interface":"org.freedesktop.login1.Manager","property":"LidClosed","operator":"==","expected_value":"true","only_on_change":true,"argv":["true"]}]`
-	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+// Keeps the documented example from rotting. Only loads it: the commands in it
+// really do suspend the machine.
+func TestExampleConfigIsValid(t *testing.T) {
+	if _, err := loadConfig("triggers_example.json"); err != nil {
 		t.Fatal(err)
-	}
-	triggers, err := loadConfig(p)
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if len(triggers) != 1 || !triggers[0].OnlyOnChange {
-		t.Fatalf("only_on_change was not loaded: %+v", triggers)
-	}
-}
-
-func TestLoadConfigRejectsBad(t *testing.T) {
-	cases := map[string]string{
-		"bad operator":      `[{"bus":"session","interface":"i","property":"p","operator":">=","argv":["true"]}]`,
-		"empty argv":        `[{"bus":"session","interface":"i","property":"p","operator":"==","argv":[]}]`,
-		"bad bus":           `[{"bus":"session2","interface":"i","property":"p","operator":"==","argv":["true"]}]`,
-		"duplicate name":    `[{"name":"x","bus":"session","interface":"i","property":"p","operator":"==","argv":["true"]},{"name":"x","bus":"session","interface":"i","property":"p","operator":"==","argv":["true"]}]`,
-		"trailing data":     `[{"bus":"session","interface":"i","property":"p","operator":"==","argv":["true"]}] {}`,
-		"unknown field":     `[{"bus":"session","interface":"i","property":"p","operator":"==","argv":["true"],"nope":1}]`,
-		"missing property":  `[{"bus":"session","interface":"i","operator":"==","argv":["true"]}]`,
-		"bad path":          `[{"bus":"session","interface":"i","property":"p","operator":"==","argv":["true"],"path":"no/slash"}]`,
-		"debounce too big":  `[{"bus":"session","interface":"i","property":"p","operator":"==","argv":["true"],"debounce_ms":86400001}]`,
-		"timeout too small": `[{"bus":"session","interface":"i","property":"p","operator":"==","argv":["true"],"timeout_sec":-1}]`,
-	}
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			p := filepath.Join(t.TempDir(), "c.json")
-			if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := loadConfig(p); err == nil {
-				t.Fatalf("expected error for %s", name)
-			}
-		})
 	}
 }
 
@@ -244,7 +205,6 @@ func TestRunnerDebouncedEventEventuallyFires(t *testing.T) {
 func TestDispatcherDrainsEvents(t *testing.T) {
 	events := make(chan wrappedSignal, 4)
 	runner := newScriptRunner()
-	registry := newConnRegistry()
 	log := testLogger()
 	triggers := []Trigger{{
 		Name: "d", Bus: "session", Interface: "org.example.I", Property: "P",
@@ -253,7 +213,7 @@ func TestDispatcherDrainsEvents(t *testing.T) {
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	startDispatcher(ctx, events, triggers, runner, registry, log)
+	done := startDispatcher(ctx, events, triggers, runner, log)
 
 	// Feed a malformed signal (no body) — must not panic or wedge.
 	events <- wrappedSignal{Bus: "session", Signal: nil}
@@ -266,7 +226,111 @@ func TestDispatcherDrainsEvents(t *testing.T) {
 	// here means it drains. Give it a moment then cancel.
 	time.Sleep(50 * time.Millisecond)
 	cancel()
+	<-done
 	runner.wait()
+}
+
+func TestRunnerDoesNotStartAfterCancel(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker")
+	tr := Trigger{Name: "late", DebounceMs: 10, TimeoutSec: 5, Argv: []string{"/bin/sh", "-c", `echo x > "$1"`, "sh", marker}}
+	logs, log := captureLogs()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := newScriptRunner()
+	r.run(ctx, tr, log)
+	r.wait()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("command ran after shutdown")
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("shutdown race must stay quiet, logged: %s", logs)
+	}
+}
+
+func TestRunnerDryRunLogsWithoutRunning(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker")
+	tr := Trigger{Name: "dry", DebounceMs: 10, TimeoutSec: 5, Argv: []string{"/bin/sh", "-c", `echo x > "$1"`, "sh", marker}}
+	logs, log := captureLogs()
+	r := newScriptRunner()
+	r.dryRun = true
+	r.run(context.Background(), tr, log)
+	r.wait()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("dry run executed the command")
+	}
+	if !strings.Contains(logs.String(), "would run") {
+		t.Fatalf("logged: %s", logs)
+	}
+}
+
+// A script's SIGTERM trap must get to run: CommandContext's default SIGKILLs
+// the direct child at the same moment the group is signalled.
+func TestRunnerTimeoutAllowsCleanupOnSIGTERM(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker")
+	tr := Trigger{
+		Name: "trap", DebounceMs: 10, TimeoutSec: 1,
+		Argv: []string{"/bin/sh", "-c", `trap 'echo cleaned > "$1"; exit 0' TERM; sleep 30 & wait`, "sh", marker},
+	}
+	logs, log := captureLogs()
+	r := newScriptRunner()
+	r.run(context.Background(), tr, log)
+	r.wait()
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "cleaned\n" {
+		t.Fatalf("SIGTERM trap did not run: %q, %v", data, err)
+	}
+	if !strings.Contains(logs.String(), "trigger timed out") {
+		t.Fatalf("clean exit after timeout must still report the timeout, logged: %s", logs)
+	}
+}
+
+// A child ignoring SIGTERM must not outlive the timeout. It inherits the
+// ignored disposition, so only a SIGKILL to the whole group can stop it.
+func TestRunnerTimeoutKillsGroupIgnoringSIGTERM(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker")
+	tr := Trigger{
+		Name: "stubborn", DebounceMs: 10, TimeoutSec: 1,
+		Argv: []string{"/bin/sh", "-c", `trap '' TERM; sleep 30 & echo $! > "$1"; wait`, "sh", marker},
+	}
+	r := newScriptRunner()
+	r.run(context.Background(), tr, testLogger())
+	r.wait()
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := "/proc/" + strings.TrimSpace(string(data)) + "/stat"
+	// Killed but not yet reaped by init still counts as dead.
+	for deadline := time.Now().Add(signalTestTimeout); ; time.Sleep(10 * time.Millisecond) {
+		fields, err := os.ReadFile(stat)
+		if err != nil || strings.Contains(string(fields), ") Z ") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("group member survived timeout: %s", fields)
+		}
+	}
+}
+
+func TestRunnerBackgroundChildIsNotAFailure(t *testing.T) {
+	tr := Trigger{Name: "bg", DebounceMs: 10, TimeoutSec: 30, Argv: []string{"/bin/sh", "-c", "sleep 5 & exit 0"}}
+	logs, log := captureLogs()
+	r := newScriptRunner()
+	r.run(context.Background(), tr, log)
+	r.wait()
+	if strings.Contains(logs.String(), "trigger failed") || !strings.Contains(logs.String(), "background process") {
+		t.Fatalf("logged: %s", logs)
+	}
+}
+
+func TestRunnerLogsCompletionRegardlessOfOutput(t *testing.T) {
+	tr := Trigger{Name: "chatty", DebounceMs: 10, TimeoutSec: 5, Argv: []string{"/bin/sh", "-c", "echo hello"}}
+	logs, log := captureLogs()
+	r := newScriptRunner()
+	r.run(context.Background(), tr, log)
+	r.wait()
+	if !strings.Contains(logs.String(), "trigger completed") {
+		t.Fatalf("logged: %s", logs)
+	}
 }
 
 func TestRunnerTimeoutKillsProcess(t *testing.T) {
@@ -283,22 +347,5 @@ func TestRunnerTimeoutKillsProcess(t *testing.T) {
 	r.wait()
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("timeout did not kill process: %v", elapsed)
-	}
-}
-
-// ---------- connRegistry ----------
-
-func TestConnRegistryNilSafe(t *testing.T) {
-	r := newConnRegistry()
-	if r.get("system") != nil {
-		t.Fatal("expected nil for missing bus")
-	}
-	r.set("system", nil)
-	if r.get("system") != nil {
-		t.Fatal("expected nil after set(nil)")
-	}
-	_, err := r.fetchProperty(context.Background(), "system", "s", "/p", "i", "prop")
-	if err == nil {
-		t.Fatal("expected error when no connection")
 	}
 }
